@@ -177,8 +177,8 @@ dist.barrier()
 classes = torch.tensor(np.load(f"{data_path}.npy")).to(device)
 
 ############################## INIT MODELS ##############################
-
-vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
+LOCAL_DIR = "model_weights/SiT_weights/sd-vae-ft-ema"
+vae = AutoencoderKL.from_pretrained(LOCAL_DIR, local_files_only=True).to(device)
 vae.eval()
 dist.barrier()
 
