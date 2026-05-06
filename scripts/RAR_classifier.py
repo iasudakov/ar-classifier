@@ -168,7 +168,7 @@ def calculate_likelihoods(
             dist.barrier()
 
             cnt += 1
-            if likelyhoods_local.argmax(dim=-1) == class_:
+            if classes[likelyhoods_local.argmax(dim=-1)] == class_:
                 true += 1
 
             if rank == 0 and not valid:
