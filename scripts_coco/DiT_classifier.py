@@ -1,8 +1,8 @@
 import argparse
+import json
 import os
 import shutil
 import sys
-from pathlib import Path
 
 import numpy as np
 import PIL
@@ -25,10 +25,8 @@ sys.path.append('/home/iasudakov/')
 from yt_tools.nirvana_utils import copy_snapshot_to_out, copy_out_to_snapshot
 
 from image_preprocessing import (
-    calc_statistics,
     center_crop_arr,
     random_crop_arr,
-    sample_imagenet,
 )
 
 
@@ -63,9 +61,34 @@ def load_checkpoint_if_consistent(checkpoint_dir, rank, world_size, device):
     return ckpt
 
 
+def topk_recall(scores, truth_mask, ks):
+    """Mean per-image top-k recall: hits-in-top-k / k, averaged over images with k > 0."""
+    accs = []
+    for i in range(scores.shape[0]):
+        k = int(ks[i].item())
+        if k == 0:
+            continue
+        topk = scores[i].topk(k).indices
+        hits = truth_mask[i, topk].sum().float().item()
+        accs.append(hits / k)
+    return float(np.mean(accs)) if accs else 0.0
+
+
+def calc_statistics_coco(likelyhoods, truth_mask, ks, n_trials_acc):
+    len_dataset, n_trials, n_class = likelyhoods.shape
+    n_averaging = n_trials // n_trials_acc
+    accs0, accs1, accs2 = [], [], []
+    for i in range(n_averaging):
+        sl = likelyhoods[:, i * n_trials_acc : (i + 1) * n_trials_acc]
+        accs0.append(topk_recall(sl.mean(dim=1), truth_mask, ks))
+        accs1.append(topk_recall(torch.softmax(sl, dim=-1).mean(dim=1), truth_mask, ks))
+        accs2.append(topk_recall(torch.logsumexp(sl, dim=1), truth_mask, ks))
+    return np.array(accs0), np.array(accs1), np.array(accs2)
+
+
 @torch.no_grad()
 def calculate_likelihoods(
-    rank, vae, model, diffusion, data_path, classes, batch_size, step_size, g,
+    rank, vae, model, diffusion, items, images_dir, classes, batch_size, step_size, g,
     checkpoint_dir=None,
     checkpoint_interval=1,
 ):
@@ -82,7 +105,7 @@ def calculate_likelihoods(
     n_class = len(classes)
     n_trials = 1000 // step_size
 
-    len_dataset = len(os.listdir(data_path))
+    len_dataset = len(items)
 
     YS = classes
     assert n_class % (batch_size * dist.get_world_size()) == 0
@@ -91,12 +114,18 @@ def calculate_likelihoods(
     ts = np.arange(step_size // 2, 1000, step_size)
 
     likelyhoods = torch.zeros((len_dataset, n_trials, n_class)).to(device)
-    targets_ = torch.zeros(len_dataset).long().to(device)
-    img_num = 0
-    skip_until = 0
 
+    truth_mask = torch.zeros((len_dataset, n_class), dtype=torch.bool, device=device)
+    ks = torch.zeros(len_dataset, dtype=torch.long, device=device)
+    for img_idx, (_, imagenet_idx) in enumerate(items):
+        if len(imagenet_idx) > 0:
+            idx_tensor = torch.tensor(imagenet_idx, dtype=torch.long, device=device)
+            truth_mask[img_idx].index_fill_(0, idx_tensor, True)
+        ks[img_idx] = len(imagenet_idx)
+
+    skip_until = 0
     cnt = 0
-    true = 0
+    running_hits = 0.0
 
     if checkpoint_dir is not None:
         ckpt = load_checkpoint_if_consistent(
@@ -111,115 +140,106 @@ def calculate_likelihoods(
                     )
             else:
                 likelyhoods.copy_(ckpt["likelyhoods"].to(device))
-                targets_.copy_(ckpt["targets_"].to(device))
                 skip_until = int(ckpt["img_num"])
                 cnt = int(ckpt.get("cnt", 0))
-                true = int(ckpt.get("true", 0))
+                running_hits = float(ckpt.get("running_hits", 0.0))
                 g.set_state(ckpt["g_state"])
                 if rank == 0:
                     print(
                         f"Resuming from checkpoint at img_num={skip_until} "
-                        f"(cnt={cnt}, true={true})"
+                        f"(cnt={cnt}, running_hits={running_hits:.4f})"
                     )
         dist.barrier()
 
-    for class_ in classes:
+    for img_num, (filename, imagenet_idx) in enumerate(items):
+        if img_num < skip_until:
+            continue
 
-        i = 0
-        file_name = f"{data_path}/{class_}_{i}.JPEG"
+        if len(imagenet_idx) == 0:
+            continue
 
-        while os.path.exists(file_name):
-            if img_num < skip_until:
-                i += 1
-                file_name = f"{data_path}/{class_}_{i}.JPEG"
-                img_num += 1
-                continue
+        file_path = os.path.join(images_dir, filename)
 
-            local_likelyhoods = torch.zeros(n_class).to(device)
+        local_likelyhoods = torch.zeros(n_class).to(device)
 
-            for trial, t in enumerate(ts):
+        for trial, t in enumerate(ts):
 
-                orig_img = PIL.Image.open(file_name).convert("RGB")
+            orig_img = PIL.Image.open(file_path).convert("RGB")
 
-                if args.use_augmentations:
-                    img = random_crop_arr(orig_img, args.image_size, g=g)
-                else:
-                    img = center_crop_arr(orig_img, args.image_size)
+            if args.use_augmentations:
+                img = random_crop_arr(orig_img, args.image_size, g=g)
+            else:
+                img = center_crop_arr(orig_img, args.image_size)
 
-                img = transform(img).to(device).unsqueeze(0)
-                latents = vae.encode(img).latent_dist.sample().mul_(0.18215)
+            img = transform(img).to(device).unsqueeze(0)
+            latents = vae.encode(img).latent_dist.sample().mul_(0.18215)
 
-                batch_ts = torch.tensor([t]).long().to(device)
-                noise = torch.randn(latents.shape, generator=g).to(device)
-                noised_latents = diffusion.q_sample(latents, batch_ts, noise)
-                noised_latents = noised_latents.tile((batch_size, 1, 1, 1))
+            batch_ts = torch.tensor([t]).long().to(device)
+            noise = torch.randn(latents.shape, generator=g).to(device)
+            noised_latents = diffusion.q_sample(latents, batch_ts, noise)
+            noised_latents = noised_latents.tile((batch_size, 1, 1, 1))
 
-                for batch_iter in range(batch_iters):
-                    batch_ind = batch_iter + rank * batch_iters
-                    cond = YS[batch_ind * batch_size : (batch_ind + 1) * batch_size]
+            for batch_iter in range(batch_iters):
+                batch_ind = batch_iter + rank * batch_iters
+                cond = YS[batch_ind * batch_size : (batch_ind + 1) * batch_size]
 
-                    with torch.autocast(device.type, torch.bfloat16):
-                        model_output = model(noised_latents, batch_ts, y=cond)
-                    B, C = noised_latents.shape[:2]
-                    noise_pred, _ = torch.split(model_output, C, dim=1)
+                with torch.autocast(device.type, torch.bfloat16):
+                    model_output = model(noised_latents, batch_ts, y=cond)
+                B, C = noised_latents.shape[:2]
+                noise_pred, _ = torch.split(model_output, C, dim=1)
 
-                    loss = ((noise - noise_pred) ** 2).sum(dim=(1, 2, 3))
+                loss = ((noise - noise_pred) ** 2).sum(dim=(1, 2, 3))
 
-                    likelyhoods[img_num, trial, batch_ind * batch_size : (batch_ind + 1) * batch_size] = -loss
-                    local_likelyhoods[batch_ind * batch_size : (batch_ind + 1) * batch_size] += -loss
+                likelyhoods[img_num, trial, batch_ind * batch_size : (batch_ind + 1) * batch_size] = -loss
+                local_likelyhoods[batch_ind * batch_size : (batch_ind + 1) * batch_size] += -loss
 
-            dist.all_reduce(local_likelyhoods, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_likelyhoods, op=dist.ReduceOp.SUM)
 
-            cnt += 1
-            if YS[local_likelyhoods.argmax()] == class_:
-                true += 1
+        cnt += 1
+        k = len(imagenet_idx)
+        truth_set = set(imagenet_idx)
+        topk = local_likelyhoods.topk(k).indices.tolist()
+        hits = sum(1 for c in topk if c in truth_set)
+        running_hits += hits / k
 
-            i += 1
-            file_name = f"{data_path}/{class_}_{i}.JPEG"
+        if rank == 0:
+            print(filename, k, running_hits / cnt)
 
-            targets_[img_num] = class_
-            img_num += 1
+        if (
+            checkpoint_dir is not None
+            and (img_num + 1) % checkpoint_interval == 0
+        ):
+            dist.barrier()
+            save_checkpoint(
+                checkpoint_dir,
+                rank,
+                {
+                    "img_num": img_num + 1,
+                    "cnt": cnt,
+                    "running_hits": running_hits,
+                    "likelyhoods": likelyhoods.cpu(),
+                    "g_state": g.get_state(),
+                    "world_size": dist.get_world_size(),
+                    "len_dataset": len_dataset,
+                    "n_class": n_class,
+                },
+            )
+            dist.barrier()
 
             if rank == 0:
-                print(img_num, true / cnt)
+                copy_out_to_snapshot('checkpoints')
+            dist.barrier()
 
-            if (
-                checkpoint_dir is not None
-                and img_num % checkpoint_interval == 0
-            ):
-                dist.barrier()
-                save_checkpoint(
-                    checkpoint_dir,
-                    rank,
-                    {
-                        "img_num": img_num,
-                        "cnt": cnt,
-                        "true": true,
-                        "likelyhoods": likelyhoods.cpu(),
-                        "targets_": targets_.cpu(),
-                        "g_state": g.get_state(),
-                        "world_size": dist.get_world_size(),
-                        "len_dataset": len_dataset,
-                        "n_class": n_class,
-                    },
-                )
-                dist.barrier()
-
-                if rank == 0:
-                    copy_out_to_snapshot('checkpoints')
-                dist.barrier()
-
-    if checkpoint_dir is not None and img_num > skip_until:
+    if checkpoint_dir is not None and len(items) > skip_until:
         dist.barrier()
         save_checkpoint(
             checkpoint_dir,
             rank,
             {
-                "img_num": img_num,
+                "img_num": len(items),
                 "cnt": cnt,
-                "true": true,
+                "running_hits": running_hits,
                 "likelyhoods": likelyhoods.cpu(),
-                "targets_": targets_.cpu(),
                 "g_state": g.get_state(),
                 "world_size": dist.get_world_size(),
                 "len_dataset": len_dataset,
@@ -233,7 +253,7 @@ def calculate_likelihoods(
         dist.barrier()
 
     dist.all_reduce(likelyhoods, op=dist.ReduceOp.SUM)
-    return likelyhoods, targets_
+    return likelyhoods, truth_mask, ks
 
 
 parser = argparse.ArgumentParser()
@@ -244,23 +264,25 @@ parser.add_argument("--downsample_size", type=int, default=8)
 
 parser.add_argument("--dit_ckpt", type=str, default="model_weights/DiT_weights/DiT-XL-2-256x256.pt")
 
-parser.add_argument("--dataset", type=str, default="val")
-parser.add_argument("--imagenet_val_path", type=str)
-parser.add_argument("--imagenet_X_path", type=str)
+parser.add_argument("--coco_labels_path", type=str,
+                    default="/home/iasudakov/COCO/val2017_imagenet_labels_filtered1000.json",
+                    help="JSON file mapping {filename: {imagenet_idx: [...], ...}}")
+parser.add_argument("--coco_images_dir", type=str,
+                    default="/home/iasudakov/COCO/val2017",
+                    help="Directory containing the COCO images.")
 
-parser.add_argument("--n_samples", type=int, default=None)
 parser.add_argument("--step_size", type=int, default=10)
 parser.add_argument("--batch_size", type=int, default=125)
 parser.add_argument("--use_augmentations", type=bool, default=False)
 parser.add_argument("--checkpoint_dir", type=str, default=None)
 parser.add_argument("--checkpoint_interval", type=int, default=1)
 parser.add_argument("--restart", action="store_true",
-                    help="Wipe existing checkpoint and dataset and start fresh.")
+                    help="Wipe existing checkpoint and start fresh.")
 
 args = parser.parse_args()
 
 if args.checkpoint_dir is None:
-    args.checkpoint_dir = f"checkpoints/dit_{args.dataset}"
+    args.checkpoint_dir = "checkpoints/dit_coco"
 
 g = torch.Generator()
 g.manual_seed(args.seed)
@@ -281,50 +303,36 @@ if rank == 0:
     copy_snapshot_to_out('checkpoints')
 dist.barrier()
 
-############################## CREATE DATA ##############################
-
-data_path = f"imagenet_data/imagenet_{args.dataset}"
-classes_npy = f"{data_path}.npy"
+############################## LOAD COCO DATA ##############################
 
 if rank == 0 and args.restart:
     if os.path.exists(args.checkpoint_dir):
         shutil.rmtree(args.checkpoint_dir)
-    if os.path.exists(data_path):
-        shutil.rmtree(data_path)
-    if os.path.exists(classes_npy):
-        os.remove(classes_npy)
 dist.barrier()
 
-data_exists = (
-    os.path.exists(classes_npy)
-    and os.path.isdir(data_path)
-    and len(os.listdir(data_path)) > 0
-)
+with open(args.coco_labels_path) as f:
+    coco_labels = json.load(f)
+
+items = [
+    (fname, list(info["imagenet_idx"]))
+    for fname, info in coco_labels.items()
+    if len(info.get("imagenet_idx", [])) > 0
+]
 
 if rank == 0:
-    if not data_exists:
-        folder = Path(data_path)
-        if folder.exists():
-            shutil.rmtree(folder)
+    print(
+        f"Loaded {len(items)} COCO images with imagenet_idx labels "
+        f"from {args.coco_labels_path}"
+    )
 
-        classes = sample_imagenet(
-            args.imagenet_X_path,
-            args.imagenet_val_path,
-            data_path,
-            N_SAMPLES=args.n_samples,
-        )
-        np.save(f"{data_path}", classes)
-        print(f"Created new dataset at {data_path}")
-    else:
-        print(f"Reusing existing dataset at {data_path}")
-dist.barrier()
-
-classes = torch.tensor(np.load(classes_npy)).to(device)
+# Always score against all 1000 ImageNet classes.
+classes = torch.arange(1000).to(device)
 
 ############################## INIT MODELS ##############################
 diffusion = create_diffusion(timestep_respacing="")
 
-tokenizer = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
+LOCAL_DIR = "model_weights/SiT_weights/sd-vae-ft-ema"
+tokenizer = AutoencoderKL.from_pretrained(LOCAL_DIR, local_files_only=True).to(device)
 tokenizer.eval()
 dist.barrier()
 
@@ -342,12 +350,13 @@ dist.barrier()
 
 g = torch.Generator()
 g.manual_seed(args.seed)
-likelyhoods, targets = calculate_likelihoods(
+likelyhoods, truth_mask, ks = calculate_likelihoods(
     rank,
     tokenizer,
     model,
     diffusion,
-    data_path,
+    items,
+    args.coco_images_dir,
     classes,
     args.batch_size,
     args.step_size,
@@ -361,8 +370,35 @@ likelyhoods, targets = calculate_likelihoods(
 n_trials = 1000 // args.step_size
 
 if rank == 0:
+    likelyhoods_cpu = likelyhoods.cpu()
+    truth_mask_cpu = truth_mask.cpu()
+    ks_cpu = ks.cpu()
+
+    n_scored = int((ks_cpu > 0).sum().item())
+    print(f"COCO top-k recall over {n_scored} images (k = #imagenet labels per image)")
+
     for i in range(1, n_trials + 1):
-        acc_i = calc_statistics(likelyhoods, targets, i, classes)
-        print(f"acc_{i}_trials:", acc_i)
+        acc_i_0, acc_i_1, acc_i_2 = calc_statistics_coco(
+            likelyhoods_cpu, truth_mask_cpu, ks_cpu, i
+        )
+        print(f"acc_0_{i}_trials:", acc_i_0.mean(), "+-", acc_i_0.std())
+
+    print("========================================")
+
+    for i in range(1, n_trials + 1):
+        acc_i_0, acc_i_1, acc_i_2 = calc_statistics_coco(
+            likelyhoods_cpu, truth_mask_cpu, ks_cpu, i
+        )
+        print(f"acc_1_{i}_trials:", acc_i_1.mean(), "+-", acc_i_1.std())
+
+    print("========================================")
+
+    for i in range(1, n_trials + 1):
+        acc_i_0, acc_i_1, acc_i_2 = calc_statistics_coco(
+            likelyhoods_cpu, truth_mask_cpu, ks_cpu, i
+        )
+        print(f"acc_2_{i}_trials:", acc_i_2.mean(), "+-", acc_i_2.std())
+
+    print("========================================")
 
 dist.destroy_process_group()
