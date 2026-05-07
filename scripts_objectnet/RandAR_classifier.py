@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import shutil
 import sys
 
 import numpy as np
@@ -17,10 +18,46 @@ sys.path.append("model_repositories/RandAR")
 sys.path.append(".")
 from RandAR.util import instantiate_from_config
 
+import sys
+sys.path.append('/home/iasudakov/')
+
+from yt_tools.nirvana_utils import copy_snapshot_to_out, copy_out_to_snapshot
+
 from image_preprocessing import (
     center_crop_arr,
     random_crop_arr,
 )
+
+
+def _checkpoint_path(checkpoint_dir, rank):
+    return os.path.join(checkpoint_dir, f"checkpoint_rank{rank}.pt")
+
+
+def save_checkpoint(checkpoint_dir, rank, state):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    final_path = _checkpoint_path(checkpoint_dir, rank)
+    tmp_path = final_path + ".tmp"
+    torch.save(state, tmp_path)
+    os.replace(tmp_path, final_path)
+
+
+def load_checkpoint_if_consistent(checkpoint_dir, rank, world_size, device):
+    """Load checkpoint only if every rank has a checkpoint file with matching world_size."""
+    path = _checkpoint_path(checkpoint_dir, rank)
+    has_local = os.path.exists(path)
+    flag = torch.tensor([1 if has_local else 0], device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    if not bool(flag.item()):
+        return None
+    ckpt = torch.load(path, map_location="cpu")
+    if ckpt.get("world_size") != world_size:
+        if rank == 0:
+            print(
+                f"Checkpoint world_size={ckpt.get('world_size')} does not match "
+                f"current world_size={world_size}; ignoring checkpoint."
+            )
+        return None
+    return ckpt
 
 
 def load_objectnet_mapping(path):
@@ -107,6 +144,8 @@ def calculate_likelihoods(
     use_raster,
     t=0,
     valid=False,
+    checkpoint_dir=None,
+    checkpoint_interval=1,
 ):
 
     if "maskgit" in config.tokenizer.target:
@@ -132,13 +171,43 @@ def calculate_likelihoods(
 
     targets_ = torch.zeros(len_dataset).long().to(device)
     img_num = 0
+    skip_until = 0
 
     cnt = 0
     true = 0
 
     classes_list = classes.tolist() if torch.is_tensor(classes) else list(classes)
 
+    if checkpoint_dir is not None:
+        ckpt = load_checkpoint_if_consistent(
+            checkpoint_dir, rank, dist.get_world_size(), device
+        )
+        if ckpt is not None:
+            if ckpt["len_dataset"] != len_dataset or ckpt["n_class"] != n_class:
+                if rank == 0:
+                    print(
+                        "Checkpoint shape does not match current dataset/classes; "
+                        "ignoring checkpoint."
+                    )
+            else:
+                likelyhoods.copy_(ckpt["likelyhoods"].to(device))
+                sum_logprobs.copy_(ckpt["sum_logprobs"].to(device))
+                targets_.copy_(ckpt["targets_"].to(device))
+                skip_until = int(ckpt["img_num"])
+                cnt = int(ckpt.get("cnt", 0))
+                true = int(ckpt.get("true", 0))
+                g.set_state(ckpt["g_state"])
+                if rank == 0:
+                    print(
+                        f"Resuming from checkpoint at img_num={skip_until} "
+                        f"(cnt={cnt}, true={true})"
+                    )
+        dist.barrier()
+
     for img_path, obj_id in samples:
+        if img_num < skip_until:
+            img_num += 1
+            continue
 
         orig_img = PIL.Image.open(img_path).convert("RGB")
 
@@ -208,6 +277,57 @@ def calculate_likelihoods(
         targets_[img_num] = obj_id
         img_num += 1
 
+        if (
+            checkpoint_dir is not None
+            and img_num % checkpoint_interval == 0
+        ):
+            dist.barrier()
+            save_checkpoint(
+                checkpoint_dir,
+                rank,
+                {
+                    "img_num": img_num,
+                    "cnt": cnt,
+                    "true": true,
+                    "likelyhoods": likelyhoods.cpu(),
+                    "sum_logprobs": sum_logprobs.cpu(),
+                    "targets_": targets_.cpu(),
+                    "g_state": g.get_state(),
+                    "world_size": dist.get_world_size(),
+                    "len_dataset": len_dataset,
+                    "n_class": n_class,
+                },
+            )
+            dist.barrier()
+
+            if rank == 0:
+                copy_out_to_snapshot('checkpoints')
+            dist.barrier()
+
+    if checkpoint_dir is not None and img_num > skip_until:
+        dist.barrier()
+        save_checkpoint(
+            checkpoint_dir,
+            rank,
+            {
+                "img_num": img_num,
+                "cnt": cnt,
+                "true": true,
+                "likelyhoods": likelyhoods.cpu(),
+                "sum_logprobs": sum_logprobs.cpu(),
+                "targets_": targets_.cpu(),
+                "g_state": g.get_state(),
+                "world_size": dist.get_world_size(),
+                "len_dataset": len_dataset,
+                "n_class": n_class,
+            },
+        )
+        dist.barrier()
+
+        if rank == 0:
+            copy_out_to_snapshot('checkpoints')
+        dist.barrier()
+
     dist.all_reduce(likelyhoods, op=dist.ReduceOp.SUM)
     dist.all_reduce(sum_logprobs, op=dist.ReduceOp.SUM)
     return likelyhoods, targets_, sum_logprobs
@@ -231,9 +351,16 @@ parser.add_argument("--use_raster", type=bool, default=False)
 parser.add_argument("--use_const_random", type=bool, default=False)
 parser.add_argument("--use_augmentations", type=bool, default=False)
 parser.add_argument("--t", type=float, default=0.0)
+parser.add_argument("--checkpoint_dir", type=str, default=None)
+parser.add_argument("--checkpoint_interval", type=int, default=1)
+parser.add_argument("--restart", action="store_true",
+                    help="Wipe existing checkpoint and start fresh.")
 
 
 args = parser.parse_args()
+
+if args.checkpoint_dir is None:
+    args.checkpoint_dir = "checkpoints/randar_objectnet"
 
 g = torch.Generator()
 g.manual_seed(args.seed)
@@ -247,7 +374,18 @@ torch.cuda.set_device(device)
 print(f"Starting rank={rank}, world_size={dist.get_world_size()}.")
 dist.barrier()
 
+############################## UPLOAD CHECKPOINT ########################
+
+if rank == 0:
+    copy_snapshot_to_out('checkpoints')
+dist.barrier()
+
 ############################## CREATE DATA ##############################
+
+if rank == 0 and args.restart:
+    if os.path.exists(args.checkpoint_dir):
+        shutil.rmtree(args.checkpoint_dir)
+dist.barrier()
 
 obj_to_im = load_objectnet_mapping(args.objectnet_mapping)
 candidate_ids = build_candidate_classes(obj_to_im, args.batch_size * world_size)
@@ -303,6 +441,8 @@ likelyhoods, targets, sum_logprobs = calculate_likelihoods(
     g,
     args.use_raster,
     args.t,
+    checkpoint_dir=args.checkpoint_dir,
+    checkpoint_interval=args.checkpoint_interval,
 )
 
 ############################## LOG METRICS ##############################
