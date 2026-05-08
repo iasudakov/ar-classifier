@@ -16,7 +16,7 @@ torch.backends.cudnn.allow_tf32 = True
 sys.path.append("model_repositories/MeanFlow")
 sys.path.append(".")
 
-from sit import SiT_models
+from sit import SiT_models, FinalLayer
 
 from image_preprocessing import (
     calc_statistics,
@@ -192,6 +192,24 @@ model = SiT_models[args.model](
 ).to(device)
 
 state_dict = torch.load(args.ckpt, map_location="cpu")
+
+# Released MeanFlow checkpoints disagree on final-layer width:
+# SiT-XL/2 keeps the original-SiT learn_sigma layout (out_channels = 2*in_channels)
+# while SiT-L/2 uses out_channels = in_channels. Match whichever the checkpoint has.
+ckpt_out_dim = state_dict["final_layer.linear.weight"].shape[0]
+ckpt_out_channels = ckpt_out_dim // (model.patch_size ** 2)
+if ckpt_out_channels != model.out_channels:
+    model.out_channels = ckpt_out_channels
+    decoder_hidden_size = model.final_layer.adaLN_modulation[-1].out_features // 2
+    model.final_layer = FinalLayer(decoder_hidden_size, model.patch_size, model.out_channels).to(device)
+    if ckpt_out_channels == 2 * model.in_channels:
+        _orig_forward = model.forward
+        def _forward_chunk(*a, **kw):
+            out = _orig_forward(*a, **kw)
+            v, _ = out.chunk(2, dim=1)
+            return v
+        model.forward = _forward_chunk
+
 model.load_state_dict(state_dict)
 model.eval()
 model.to(torch.bfloat16)
