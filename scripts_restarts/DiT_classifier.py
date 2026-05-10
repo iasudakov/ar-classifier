@@ -323,8 +323,10 @@ classes = torch.tensor(np.load(classes_npy)).to(device)
 
 ############################## INIT MODELS ##############################
 diffusion = create_diffusion(timestep_respacing="")
-
-tokenizer = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
+tokenizer = AutoencoderKL.from_pretrained(
+    "stabilityai/sd-vae-ft-ema",
+    cache_dir="model_weights/DiT_weights",
+).to(device)
 tokenizer.eval()
 dist.barrier()
 
