@@ -179,6 +179,7 @@ def calculate_likelihoods(
                     latents = vae.encode(img).latent_dist.sample().mul_(0.18215)
 
                 t = torch.tensor(t_val, device=device)
+                t = torch.clamp(t, 0.05, 0.95)
                 noise = torch.randn(latents.shape, generator=g).to(device)
 
                 # Path-dependent interpolation x_t and instantaneous velocity v_t.
