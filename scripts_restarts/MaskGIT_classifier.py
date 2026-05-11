@@ -90,7 +90,7 @@ def get_masking_ratios(n_masks, mode="arccos"):
 @torch.no_grad()
 def calculate_likelihoods(
     rank, vqgan, vit, data_path, classes, batch_size,
-    n_masks, mask_mode, codebook_size, patch_size, g,
+    n_masks, mask_mode, K, codebook_size, patch_size, g,
     checkpoint_dir=None,
     checkpoint_interval=1,
 ):
@@ -110,7 +110,7 @@ def calculate_likelihoods(
     assert n_class % (batch_size * dist.get_world_size()) == 0
     batch_iters = n_class // (batch_size * dist.get_world_size())
 
-    # Fixed masking ratios (one random mask sampled per ratio)
+    # Fixed masking ratios (K random masks sampled per ratio, averaged)
     masking_ratios = get_masking_ratios(n_masks, mode=mask_mode)
 
     likelyhoods = torch.zeros((len_dataset, n_masks, n_class)).to(device)
@@ -170,44 +170,55 @@ def calculate_likelihoods(
 
             for trial, ratio in enumerate(masking_ratios):
 
-                # Sample a random binary mask at this masking ratio
-                mask_flat = (torch.rand(n_tokens, generator=g) < ratio).to(device)  # (n_tokens,)
-                n_masked = int(mask_flat.sum().item())
-                if n_masked == 0:
-                    continue
+                # Accumulate -loss across K masks at this ratio (rank-owned classes only)
+                trial_neg_loss = torch.zeros(n_class, device=device)
+                valid_k = 0
 
-                # Apply mask: replace masked positions with mask token
-                masked_code = code.clone()
-                masked_code.view(-1)[mask_flat] = mask_token
+                for _ in range(K):
+                    # Sample a random binary mask at this masking ratio
+                    mask_flat = (torch.rand(n_tokens, generator=g) < ratio).to(device)  # (n_tokens,)
+                    n_masked = int(mask_flat.sum().item())
+                    if n_masked == 0:
+                        continue
 
-                # Tile masked code across all classes in the batch
-                masked_code_tiled = masked_code.tile(batch_size, 1, 1)  # (B, H, W)
+                    # Apply mask: replace masked positions with mask token
+                    masked_code = code.clone()
+                    masked_code.view(-1)[mask_flat] = mask_token
 
-                # Ground-truth tokens at masked positions (same for all classes)
-                code_flat = code.view(-1)                       # (n_tokens,)
-                masked_targets = code_flat[mask_flat]           # (n_masked,)
-                masked_targets_tiled = (masked_targets.unsqueeze(0).expand(batch_size, -1).reshape(-1))
+                    # Tile masked code across all classes in the batch
+                    masked_code_tiled = masked_code.tile(batch_size, 1, 1)  # (B, H, W)
 
-                for batch_iter in range(batch_iters):
-                    batch_ind = batch_iter + rank * batch_iters
-                    cond = YS[batch_ind * batch_size : (batch_ind + 1) * batch_size]
+                    # Ground-truth tokens at masked positions (same for all classes)
+                    code_flat = code.view(-1)                       # (n_tokens,)
+                    masked_targets = code_flat[mask_flat]           # (n_masked,)
+                    masked_targets_tiled = (masked_targets.unsqueeze(0).expand(batch_size, -1).reshape(-1))
 
-                    with torch.autocast(device.type, torch.bfloat16):
-                        logits = vit(masked_code_tiled, cond, drop_label=drop_label)
-                        # logits: (B, n_tokens, codebook_size+1)
+                    for batch_iter in range(batch_iters):
+                        batch_ind = batch_iter + rank * batch_iters
+                        cond = YS[batch_ind * batch_size : (batch_ind + 1) * batch_size]
 
-                    # Extract logits at masked positions and cast to float for CE
-                    # masked_logits: (B, n_masked, codebook_size+1)
-                    masked_logits = logits[:, mask_flat, :].float()
-                    masked_logits_flat = masked_logits.reshape(-1, codebook_size + 1)
+                        with torch.autocast(device.type, torch.bfloat16):
+                            logits = vit(masked_code_tiled, cond, drop_label=drop_label)
+                            # logits: (B, n_tokens, codebook_size+1)
 
-                    # Cross-entropy averaged over masked tokens → ELBO estimate
-                    # Analogous to DiT averaging MSE over all noise dimensions
-                    ce_per_token = F.cross_entropy(masked_logits_flat, masked_targets_tiled, reduction='none')
-                    loss_per_class = ce_per_token.reshape(batch_size, n_masked).mean(dim=1)
+                        # Extract logits at masked positions and cast to float for CE
+                        # masked_logits: (B, n_masked, codebook_size+1)
+                        masked_logits = logits[:, mask_flat, :].float()
+                        masked_logits_flat = masked_logits.reshape(-1, codebook_size + 1)
 
-                    likelyhoods[img_num, trial, batch_ind*batch_size : (batch_ind + 1)*batch_size] = -loss_per_class
-                    local_likelyhoods[batch_ind*batch_size : (batch_ind + 1)*batch_size] += -loss_per_class
+                        # Cross-entropy averaged over masked tokens → ELBO estimate
+                        # Analogous to DiT averaging MSE over all noise dimensions
+                        ce_per_token = F.cross_entropy(masked_logits_flat, masked_targets_tiled, reduction='none')
+                        loss_per_class = ce_per_token.reshape(batch_size, n_masked).mean(dim=1)
+
+                        trial_neg_loss[batch_ind*batch_size : (batch_ind + 1)*batch_size] += -loss_per_class
+
+                    valid_k += 1
+
+                if valid_k > 0:
+                    trial_neg_loss /= valid_k
+                    likelyhoods[img_num, trial] += trial_neg_loss
+                    local_likelyhoods += trial_neg_loss
 
             dist.all_reduce(local_likelyhoods, op=dist.ReduceOp.SUM)
 
@@ -297,6 +308,8 @@ parser.add_argument("--n_masks", type=int, default=100,
 parser.add_argument("--mask_mode", type=str, default="arccos",
                     choices=["arccos", "linear", "cosine", "square"],
                     help="Schedule for masking ratios (arccos matches MaskGIT training)")
+parser.add_argument("--K", type=int, default=1,
+                    help="Number of random masks sampled per ratio; the per-class CE is averaged over them.")
 parser.add_argument("--batch_size", type=int, default=125)
 parser.add_argument("--use_augmentations", type=bool, default=False)
 parser.add_argument("--checkpoint_dir", type=str, default=None)
@@ -412,6 +425,7 @@ likelyhoods, targets = calculate_likelihoods(
     args.batch_size,
     args.n_masks,
     args.mask_mode,
+    args.K,
     codebook_size,
     patch_size,
     g,
