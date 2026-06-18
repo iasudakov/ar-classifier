@@ -14,10 +14,12 @@ import torchvision.transforms as transforms
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 sys.path.append("model_repositories/1d-tokenizer")
+sys.path.append("model_repositories/RandAR")
 sys.path.append(".")
 
 import demo_util
 from utils.train_utils import create_pretrained_tokenizer
+from RandAR.util import instantiate_from_config
 from image_preprocessing import (
     calc_statistics,
     center_crop_arr,
@@ -115,7 +117,17 @@ def calculate_likelihoods(
     use_raster=False,
     valid=False,
 ):
-    transform = transforms.Compose([transforms.ToTensor()])
+    if args.tokenizer == "llamagen":
+        # LlamaGen VQ expects images normalized to [-1, 1].
+        transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
+            ]
+        )
+    else:
+        # MaskGIT VQ expects images in [0, 1].
+        transform = transforms.Compose([transforms.ToTensor()])
 
     device = next(model.parameters()).device
     n_class = len(classes)
@@ -151,8 +163,17 @@ def calculate_likelihoods(
                 img = transform(img).to(device).unsqueeze(0)
 
                 with torch.no_grad():
-                    latents = tokenizer.encode(img)
-                    latents = latents[0].tile((batch_size, 1))
+                    if args.tokenizer == "llamagen":
+                        # LlamaGen tokenization (optionally noise-augmented by `t`).
+                        h = tokenizer.encoder(img)
+                        h = tokenizer.quant_conv(h)
+                        if args.t > 0:
+                            h = (1 - args.t) * h + torch.randn_like(h) * args.t
+                        _, _, info = tokenizer.quantize(h)
+                        latents = info[2].tile((batch_size, 1))
+                    else:
+                        latents = tokenizer.encode(img)
+                        latents = latents[0].tile((batch_size, 1))
 
                 if use_raster:
                     token_order = None
@@ -208,6 +229,14 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--image_size", type=int, default=256)
 parser.add_argument("--config", type=str, default="model_repositories/1d-tokenizer/configs/training/generator/rar.yaml")
 parser.add_argument("--downsample_size", type=int, default=16)
+parser.add_argument("--tokenizer", type=str, default="maskgit", choices=["maskgit", "llamagen"])
+parser.add_argument("--vq_config", type=str,
+                    default="model_repositories/RandAR/configs/randar/randar_l_0.3b_llamagen.yaml",
+                    help="Config providing the LlamaGen VQ architecture (used when --tokenizer llamagen).")
+parser.add_argument("--vq_ckpt", type=str, default="model_weights/RAR_weights/vq_ds16_c2i.pt",
+                    help="LlamaGen VQ checkpoint (used when --tokenizer llamagen).")
+parser.add_argument("--t", type=float, default=0.0,
+                    help="LlamaGen latent noise-augmentation strength.")
 
 parser.add_argument("--dataset", type=str, default="val")
 parser.add_argument("--imagenet_val_path", type=str)
@@ -258,14 +287,25 @@ classes = torch.tensor(np.load(f"{data_path}.npy")).to(device)
 ############################## INIT MODELS ##############################
 
 config = demo_util.get_config(args.config)
-config.experiment.generator_checkpoint = f"{args.weights_path}/{args.rar_model_size}.bin"
+config.experiment.generator_checkpoint = f"{args.weights_path}/{args.rar_model_size}_{args.tokenizer}.bin"
 config.model.vq_model.pretrained_tokenizer_weight = f"{args.weights_path}/maskgit-vqgan-imagenet-f16-256.bin"
+if args.tokenizer == "llamagen":
+    # Build the LlamaGen VQ from its training config so the architecture matches the
+    # checkpoint, and mirror its codebook size onto the RAR generator (16384 vs 1024).
+    vq_config = demo_util.get_config(args.vq_config)
+    config.model.vq_model.codebook_size = vq_config.tokenizer.params.codebook_size
 config.model.generator.hidden_size = {"rar_b": 768, "rar_l": 1024, "rar_xl": 1280, "rar_xxl": 1408}[args.rar_model_size]
 config.model.generator.num_hidden_layers = {"rar_b": 24, "rar_l": 24, "rar_xl": 32, "rar_xxl": 40}[args.rar_model_size]
 config.model.generator.num_attention_heads = 16
 config.model.generator.intermediate_size = {"rar_b": 3072, "rar_l": 4096, "rar_xl": 5120, "rar_xxl": 6144}[args.rar_model_size]
 
-tokenizer = create_pretrained_tokenizer(config)
+if args.tokenizer == "llamagen":
+    tokenizer = instantiate_from_config(vq_config.tokenizer)
+    vq_ckpt = torch.load(args.vq_ckpt, map_location="cpu")
+    vq_state_dict = vq_ckpt["model"] if "model" in vq_ckpt else vq_ckpt
+    tokenizer.load_state_dict(vq_state_dict)
+else:
+    tokenizer = create_pretrained_tokenizer(config)
 generator = demo_util.get_rar_generator(config)
 tokenizer.to(device)
 generator.to(device)
