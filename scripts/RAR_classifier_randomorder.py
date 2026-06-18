@@ -231,7 +231,7 @@ parser.add_argument("--config", type=str, default="model_repositories/1d-tokeniz
 parser.add_argument("--downsample_size", type=int, default=16)
 parser.add_argument("--tokenizer", type=str, default="maskgit", choices=["maskgit", "llamagen"])
 parser.add_argument("--vq_config", type=str,
-                    default="model_repositories/RandAR/configs/randar/randar_l_0.3b_llamagen.yaml",
+                    default="model_repositories/1d-tokenizer/llamagen_tokenizer.yaml",
                     help="Config providing the LlamaGen VQ architecture (used when --tokenizer llamagen).")
 parser.add_argument("--vq_ckpt", type=str, default="model_weights/RAR_weights/vq_ds16_c2i.pt",
                     help="LlamaGen VQ checkpoint (used when --tokenizer llamagen).")
