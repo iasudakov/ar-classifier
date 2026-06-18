@@ -356,7 +356,7 @@ parser.add_argument("--tokenizer", type=str, default="maskgit", choices=["maskgi
 parser.add_argument("--vq_config", type=str,
                     default="model_repositories/RandAR/configs/randar/randar_l_0.3b_llamagen.yaml",
                     help="Config providing the LlamaGen VQ architecture (used when --tokenizer llamagen).")
-parser.add_argument("--vq_ckpt", type=str, default="model_weights/RandAR_weights/vq_ds16_c2i.pt",
+parser.add_argument("--vq_ckpt", type=str, default="model_weights/RAR_weights/vq_ds16_c2i.pt",
                     help="LlamaGen VQ checkpoint (used when --tokenizer llamagen).")
 parser.add_argument("--t", type=float, default=0.0,
                     help="LlamaGen latent noise-augmentation strength.")
